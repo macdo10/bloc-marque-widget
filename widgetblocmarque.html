@@ -164,6 +164,37 @@ function greedyWrap(words, width) {
   return lines;
 }
 
+function isEt(word) {
+  return word.replace(/^[.,;:!?()«»"'’]+|[.,;:!?()«»"'’]+$/g, "").toLowerCase() === "et";
+}
+
+// Découpe `words` en segments : chaque occurrence de « et » (hors premier
+// mot d'un segment) démarre un nouveau segment, forçant un retour à la
+// ligne avant « et » (ex. "à Moncton et Halifax" -> ["à","Moncton"] /
+// ["et","Halifax"]).
+function splitOnEt(words) {
+  const segments = [];
+  let current = [];
+  for (const word of words) {
+    if (current.length && isEt(word)) {
+      segments.push(current);
+      current = [word];
+    } else {
+      current.push(word);
+    }
+  }
+  if (current.length) segments.push(current);
+  return segments;
+}
+
+function wrapRest(words, width) {
+  const lines = [];
+  for (const segment of splitOnEt(words)) {
+    lines.push(...greedyWrap(segment, width));
+  }
+  return lines;
+}
+
 function wrapIntitule(text, maxChars = MAX_CHARS_PER_LINE, maxLines = MAX_LINES) {
   text = normalizeApostrophes((text || "").trim());
   if (!text) return [];
@@ -201,7 +232,7 @@ function wrapIntitule(text, maxChars = MAX_CHARS_PER_LINE, maxLines = MAX_LINES)
   let width = maxChars;
   let lines;
   while (true) {
-    lines = fixedLines.concat(greedyWrap(restWords, width));
+    lines = fixedLines.concat(wrapRest(restWords, width));
     if (lines.length <= maxLines || width > maxChars * 3) break;
     width += 1;
   }
