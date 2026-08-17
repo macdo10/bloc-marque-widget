@@ -112,7 +112,14 @@
     Bloc-marque officiel de l'État (composant DSFR « logo », SIG, Etalab 2.0) —
     intitulé découpé selon les règles de la Charte graphique de l'État (25
     car./ligne, 6 lignes max., institution en tête). Usage réservé aux
-    administrations et services publics.
+    administrations et services publics.<br>
+    Nom de fichier : <code>&lt;tag ou intitulé&gt;-white.png</code> /
+    <code>-transparent.png</code> / <code>-dark.png</code> /
+    <code>-dark-transparent.png</code> selon le thème et le fond choisis —
+    chaque variante est enregistrée comme une pièce jointe distincte ; seule
+    une variante déjà enregistrée sous ce même nom exact est remplacée.
+    Associez la colonne « Identifiant unique » (ex. <code>$tag</code>) pour
+    des noms de fichiers propres lors des téléchargements groupés.
   </div>
 </div>
 
@@ -523,6 +530,36 @@ if (typeof module !== "undefined") {
     return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
+  // --- Nom de fichier : identifiant de ligne + variante (thème/fond) -------
+  // Objectif : (1) chaque combinaison thème/fond produit un nom de fichier
+  // distinct (ex. "-white", "-transparent", "-dark", "-dark-transparent"),
+  // pour ne jamais écraser une variante par une autre ; (2) le nom est basé
+  // sur un identifiant propre à la ligne (colonne "Tag", ex. $tag =
+  // "ang-luanda-amb") plutôt que sur l'intitulé du poste ou l'ID interne
+  // Grist, pour rester lisible quand on télécharge plusieurs fichiers à la
+  // fois.
+  function slugify(text) {
+    return (text || '')
+      .normalize('NFD').replace(/[̀-ͯ]/g, '') // retire les accents
+      .replace(/[^a-zA-Z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .toLowerCase();
+  }
+
+  function variantSuffix(cfg) {
+    const transparent = cfg.background === 'transparent';
+    if (cfg.theme === 'dark') return transparent ? 'dark-transparent' : 'dark';
+    return transparent ? 'transparent' : 'white';
+  }
+
+  function computeFileName(cfg) {
+    const tagRaw = currentMapped ? (currentMapped.Tag || '') : '';
+    const sourceRaw = currentMapped ? (currentMapped.Source || '') : '';
+    const base = slugify(tagRaw) || slugify(sourceRaw) ||
+      (currentRecord ? ('enregistrement-' + currentRecord.id) : 'bloc-marque');
+    return base + '-' + variantSuffix(cfg) + '.png';
+  }
+
   async function buildExportCanvas() {
     const cfg = getConfig();
     const text = currentMapped ? (currentMapped.Source || '') : '';
@@ -540,18 +577,19 @@ if (typeof module !== "undefined") {
   async function onDownload() {
     setStatus('Génération de l’image…');
     try {
+      const cfg = getConfig();
+      const fileName = computeFileName(cfg);
       const canvas = await buildExportCanvas();
       const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      const suffix = currentRecord ? ('-' + currentRecord.id) : '';
       a.href = url;
-      a.download = 'bloc-marque' + suffix + '.png';
+      a.download = fileName;
       document.body.appendChild(a);
       a.click();
       a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 2000);
-      setStatus('Image téléchargée.', 'ok');
+      setStatus('Image téléchargée : ' + fileName, 'ok');
     } catch (e) {
       console.error(e);
       setStatus('Erreur : ' + e.message, 'error');
@@ -569,27 +607,58 @@ if (typeof module !== "undefined") {
     }
     setStatus('Enregistrement dans Grist…');
     try {
+      const cfg = getConfig();
+      const fileName = computeFileName(cfg);
       const canvas = await buildExportCanvas();
       const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
 
       const tokenInfo = await grist.docApi.getAccessToken({ readOnly: false });
-      const uploadUrl = tokenInfo.baseUrl + '/attachments?auth=' + tokenInfo.token;
+      const authQS = 'auth=' + tokenInfo.token;
+
+      // Pièces jointes déjà associées à cette ligne (colonne Logo).
+      const existingIds = Array.isArray(currentMapped.Logo)
+        ? currentMapped.Logo.filter((v) => typeof v === 'number')
+        : [];
+
+      // On ne remplace QUE la variante qui porte exactement le même nom de
+      // fichier (même thème + même fond) que celle en cours de génération ;
+      // les autres variantes déjà enregistrées (noms différents) sont
+      // conservées telles quelles.
+      let matchedId = null;
+      const keptIds = [];
+      for (const id of existingIds) {
+        let sameName = false;
+        try {
+          const metaResp = await fetch(tokenInfo.baseUrl + '/attachments/' + id + '?' + authQS);
+          if (metaResp.ok) {
+            const meta = await metaResp.json();
+            sameName = !!(meta && meta.fileName === fileName);
+          }
+        } catch (e) { /* métadonnée illisible : on conserve la pièce jointe par prudence */ }
+        if (sameName && matchedId === null) {
+          matchedId = id; // remplacée : on ne la remet pas dans keptIds
+        } else {
+          keptIds.push(id);
+        }
+      }
+
       const formData = new FormData();
-      formData.set('upload', blob, 'bloc-marque-' + currentRecord.id + '.png');
-      const uploadResp = await fetch(uploadUrl, {
+      formData.set('upload', blob, fileName);
+      const uploadResp = await fetch(tokenInfo.baseUrl + '/attachments?' + authQS, {
         method: 'POST',
         body: formData,
         headers: { 'X-Requested-With': 'XMLHttpRequest' },
       });
       if (!uploadResp.ok) throw new Error('Téléversement refusé (' + uploadResp.status + ')');
       const ids = await uploadResp.json();
-      const attachmentId = ids[0];
+      const newId = ids[0];
+      const finalIds = keptIds.concat([newId]);
 
       const tableId = await grist.getTable().getTableId();
-      const patch = grist.mapColumnNamesBack({ Logo: [grist.GristObjCode.List, attachmentId] });
+      const patch = grist.mapColumnNamesBack({ Logo: [grist.GristObjCode.List].concat(finalIds) });
       await grist.docApi.applyUserActions([['UpdateRecord', tableId, currentRecord.id, patch]]);
 
-      setStatus('Enregistré dans Grist.', 'ok');
+      setStatus((matchedId !== null ? 'Variante remplacée : ' : 'Nouvelle variante ajoutée : ') + fileName, 'ok');
     } catch (e) {
       console.error(e);
       setStatus('Erreur : ' + e.message, 'error');
@@ -608,6 +677,7 @@ if (typeof module !== "undefined") {
     requiredAccess: 'full',
     columns: [
       { name: 'Source', title: 'Intitulé du poste', type: 'Text' },
+      { name: 'Tag', title: 'Identifiant unique de la ligne (ex. $tag)', type: 'Text', optional: true },
       { name: 'Logo', title: 'Logo (pièce jointe, destination)', type: 'Attachments', optional: true },
     ],
     allowSelectBy: true,
