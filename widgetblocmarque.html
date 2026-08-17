@@ -552,17 +552,29 @@ if (typeof module !== "undefined") {
     return transparent ? 'transparent' : 'white';
   }
 
-  function computeFileName(cfg) {
-    const tagRaw = currentMapped ? (currentMapped.Tag || '') : '';
-    const sourceRaw = currentMapped ? (currentMapped.Source || '') : '';
+  // IMPORTANT : `record` et `mapped` sont toujours passés en paramètres
+  // explicites (jamais relus depuis les variables partagées `currentRecord`/
+  // `currentMapped` après un `await`). Le widget peut recevoir un nouvel
+  // événement `onRecord` (changement de ligne sélectionnée) PENDANT qu'un
+  // enregistrement précédent est encore en cours (réseau : jeton, lecture
+  // des pièces jointes existantes, téléversement...) — si ces fonctions
+  // relisaient les variables partagées à ce moment-là, l'enregistrement en
+  // cours se retrouverait à écrire sur la ligne devenue courante entre
+  // temps, au lieu de la ligne pour laquelle il a été déclenché (bug
+  // constaté : le logo d'une ligne précédente se retrouvait attaché à la
+  // ligne sélectionnée ensuite). Chaque appel à onSave()/onDownload() fige
+  // donc sa propre "photo" de la ligne concernée dès son déclenchement.
+
+  function computeFileName(cfg, mapped, record) {
+    const tagRaw = mapped ? (mapped.Tag || '') : '';
+    const sourceRaw = mapped ? (mapped.Source || '') : '';
     const base = slugify(tagRaw) || slugify(sourceRaw) ||
-      (currentRecord ? ('enregistrement-' + currentRecord.id) : 'bloc-marque');
+      (record ? ('enregistrement-' + record.id) : 'bloc-marque');
     return base + '-' + variantSuffix(cfg) + '.png';
   }
 
-  async function buildExportCanvas() {
-    const cfg = getConfig();
-    const text = currentMapped ? (currentMapped.Source || '') : '';
+  async function buildExportCanvas(cfg, mapped) {
+    const text = mapped ? (mapped.Source || '') : '';
     const lines = wrapIntitule(text);
     return renderBlocMarqueToCanvas({
       lines,
@@ -575,11 +587,14 @@ if (typeof module !== "undefined") {
   }
 
   async function onDownload() {
+    // Photo de la ligne courante AU MOMENT DU CLIC — jamais relue ensuite.
+    const record = currentRecord;
+    const mapped = currentMapped;
     setStatus('Génération de l’image…');
     try {
       const cfg = getConfig();
-      const fileName = computeFileName(cfg);
-      const canvas = await buildExportCanvas();
+      const fileName = computeFileName(cfg, mapped, record);
+      const canvas = await buildExportCanvas(cfg, mapped);
       const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -597,27 +612,33 @@ if (typeof module !== "undefined") {
   }
 
   async function onSave() {
+    // Photo de la ligne concernée PAR CET APPEL — jamais relue depuis
+    // `currentRecord`/`currentMapped` plus bas (cf. commentaire ci-dessus).
+    const record = currentRecord;
+    const mapped = currentMapped;
+
     if (!logoColumnMapped) {
       setStatus('Associez une colonne « Logo » (Pièces jointes) pour activer l’enregistrement.', 'error');
       return;
     }
-    if (!currentRecord) {
+    if (!record) {
       setStatus('Aucune ligne sélectionnée.', 'error');
       return;
     }
     setStatus('Enregistrement dans Grist…');
     try {
       const cfg = getConfig();
-      const fileName = computeFileName(cfg);
-      const canvas = await buildExportCanvas();
+      const fileName = computeFileName(cfg, mapped, record);
+      const canvas = await buildExportCanvas(cfg, mapped);
       const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
 
       const tokenInfo = await grist.docApi.getAccessToken({ readOnly: false });
       const authQS = 'auth=' + tokenInfo.token;
 
-      // Pièces jointes déjà associées à cette ligne (colonne Logo).
-      const existingIds = Array.isArray(currentMapped.Logo)
-        ? currentMapped.Logo.filter((v) => typeof v === 'number')
+      // Pièces jointes déjà associées à CETTE ligne (photo prise ci-dessus,
+      // pas une relecture de currentMapped qui pourrait déjà avoir changé).
+      const existingIds = Array.isArray(mapped.Logo)
+        ? mapped.Logo.filter((v) => typeof v === 'number')
         : [];
 
       // On ne remplace QUE la variante qui porte exactement le même nom de
@@ -656,12 +677,23 @@ if (typeof module !== "undefined") {
 
       const tableId = await grist.getTable().getTableId();
       const patch = grist.mapColumnNamesBack({ Logo: [grist.GristObjCode.List].concat(finalIds) });
-      await grist.docApi.applyUserActions([['UpdateRecord', tableId, currentRecord.id, patch]]);
+      // On cible explicitement `record.id` (la photo prise à l'entrée dans
+      // onSave), jamais `currentRecord.id` : si la sélection a changé
+      // entre-temps, currentRecord pointe déjà vers une AUTRE ligne, et
+      // écrire dessus par erreur est précisément le bug corrigé ici.
+      await grist.docApi.applyUserActions([['UpdateRecord', tableId, record.id, patch]]);
 
-      setStatus((matchedId !== null ? 'Variante remplacée : ' : 'Nouvelle variante ajoutée : ') + fileName, 'ok');
+      // N'affiche le statut que si cette ligne est toujours celle affichée
+      // à l'écran (sinon le message pourrait sembler concerner la ligne
+      // actuellement sélectionnée alors qu'il concerne une ligne quittée).
+      if (currentRecord && currentRecord.id === record.id) {
+        setStatus((matchedId !== null ? 'Variante remplacée : ' : 'Nouvelle variante ajoutée : ') + fileName, 'ok');
+      }
     } catch (e) {
       console.error(e);
-      setStatus('Erreur : ' + e.message, 'error');
+      if (currentRecord && currentRecord.id === record.id) {
+        setStatus('Erreur : ' + e.message, 'error');
+      }
     }
   }
 
